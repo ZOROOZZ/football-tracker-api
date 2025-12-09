@@ -1,36 +1,145 @@
+// Simple JWT implementation (no external dependencies)
+function base64UrlEncode(str) {
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+function createToken(payload, secret) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signature = base64UrlEncode(encodedHeader + '.' + encodedPayload + secret);
+  return `${encodedHeader}.${encodedPayload}.${signature}`;
+}
+
+function verifyToken(token, secret) {
+  try {
+    const [header, payload, signature] = token.split('.');
+    const expectedSignature = base64UrlEncode(header + '.' + payload + secret);
+    if (signature !== expectedSignature) return null;
+    return JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+  } catch {
+    return null;
+  }
+}
+
+// Simple password hashing (in production, use bcrypt)
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS headers
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
-    // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
     }
 
+    const JWT_SECRET = 'your-secret-key-change-this-in-production';
+
+    // Auth middleware
+    function getAuthUser(request) {
+      const authHeader = request.headers.get('Authorization');
+      if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+      const token = authHeader.substring(7);
+      return verifyToken(token, JWT_SECRET);
+    }
+
     try {
-      // GET /api/matches - Get all matches
+      // POST /api/auth/login - Login
+      if (path === '/api/auth/login' && request.method === 'POST') {
+        const { username, password } = await request.json();
+        
+        const user = await env.DB.prepare(
+          'SELECT * FROM users WHERE username = ?'
+        ).bind(username).first();
+
+        if (!user) {
+          return jsonResponse({ error: 'Invalid credentials' }, corsHeaders, 401);
+        }
+
+        const passwordHash = await hashPassword(password);
+        if (passwordHash !== user.password_hash) {
+          return jsonResponse({ error: 'Invalid credentials' }, corsHeaders, 401);
+        }
+
+        const token = createToken(
+          { id: user.id, username: user.username, role: user.role },
+          JWT_SECRET
+        );
+
+        return jsonResponse({
+          token,
+          user: { id: user.id, username: user.username, role: user.role }
+        }, corsHeaders);
+      }
+
+      // POST /api/auth/register - Register new user (admin only)
+      if (path === '/api/auth/register' && request.method === 'POST') {
+        const authUser = getAuthUser(request);
+        if (!authUser || authUser.role !== 'admin') {
+          return jsonResponse({ error: 'Unauthorized' }, corsHeaders, 403);
+        }
+
+        const { username, password, role } = await request.json();
+        const passwordHash = await hashPassword(password);
+
+        try {
+          await env.DB.prepare(
+            'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)'
+          ).bind(username, passwordHash, role || 'user').run();
+
+          return jsonResponse({ success: true, message: 'User created' }, corsHeaders);
+        } catch (error) {
+          return jsonResponse({ error: 'Username already exists' }, corsHeaders, 400);
+        }
+      }
+
+      // GET /api/auth/me - Get current user
+      if (path === '/api/auth/me' && request.method === 'GET') {
+        const authUser = getAuthUser(request);
+        if (!authUser) {
+          return jsonResponse({ error: 'Unauthorized' }, corsHeaders, 401);
+        }
+        return jsonResponse({ user: authUser }, corsHeaders);
+      }
+
+      // GET /api/matches - Get all matches (requires auth)
       if (path === '/api/matches' && request.method === 'GET') {
+        const authUser = getAuthUser(request);
+        if (!authUser) {
+          return jsonResponse({ error: 'Unauthorized' }, corsHeaders, 401);
+        }
+
         const matches = await env.DB.prepare(
           'SELECT * FROM matches ORDER BY match_date DESC'
         ).all();
         return jsonResponse(matches.results, corsHeaders);
       }
 
-      // GET /api/players - Get all players
+      // GET /api/players - Get all players (requires auth)
       if (path === '/api/players' && request.method === 'GET') {
+        const authUser = getAuthUser(request);
+        if (!authUser) {
+          return jsonResponse({ error: 'Unauthorized' }, corsHeaders, 401);
+        }
+
         const players = await env.DB.prepare(
           'SELECT * FROM players ORDER BY total_goals DESC'
         ).all();
         
-        // Get match history for each player
         for (let player of players.results) {
           const history = await env.DB.prepare(
             `SELECT mp.*, m.match_date 
@@ -51,36 +160,34 @@ export default {
         return jsonResponse(players.results, corsHeaders);
       }
 
-      // POST /api/matches - Create new match
+      // POST /api/matches - Create match (admin only)
       if (path === '/api/matches' && request.method === 'POST') {
+        const authUser = getAuthUser(request);
+        if (!authUser || authUser.role !== 'admin') {
+          return jsonResponse({ error: 'Unauthorized - Admin only' }, corsHeaders, 403);
+        }
+
         const data = await request.json();
         const { date, players } = data;
 
-        // Insert match
         const matchResult = await env.DB.prepare(
           'INSERT INTO matches (match_date) VALUES (?)'
         ).bind(date).run();
 
         const matchId = matchResult.meta.last_row_id;
 
-        // Process each player
         for (let player of players) {
-          // Check if player exists
           let playerRecord = await env.DB.prepare(
             'SELECT * FROM players WHERE name = ?'
           ).bind(player.name).first();
 
           if (!playerRecord) {
-            // Create new player
             const playerResult = await env.DB.prepare(
               'INSERT INTO players (name, total_goals, total_saves, total_assists, matches_played) VALUES (?, ?, ?, ?, 1)'
             ).bind(player.name, player.goals, player.saves, player.assists).run();
             
-            playerRecord = {
-              id: playerResult.meta.last_row_id
-            };
+            playerRecord = { id: playerResult.meta.last_row_id };
           } else {
-            // Update existing player
             await env.DB.prepare(
               `UPDATE players 
                SET total_goals = total_goals + ?, 
@@ -91,7 +198,6 @@ export default {
             ).bind(player.goals, player.saves, player.assists, playerRecord.id).run();
           }
 
-          // Insert match performance
           await env.DB.prepare(
             'INSERT INTO match_performances (match_id, player_id, goals, saves, assists) VALUES (?, ?, ?, ?, ?)'
           ).bind(matchId, playerRecord.id, player.goals, player.saves, player.assists).run();
@@ -100,16 +206,19 @@ export default {
         return jsonResponse({ success: true, matchId }, corsHeaders);
       }
 
-      // DELETE /api/matches/:id - Delete a match
+      // DELETE /api/matches/:id - Delete match (admin only)
       if (path.startsWith('/api/matches/') && request.method === 'DELETE') {
+        const authUser = getAuthUser(request);
+        if (!authUser || authUser.role !== 'admin') {
+          return jsonResponse({ error: 'Unauthorized - Admin only' }, corsHeaders, 403);
+        }
+
         const matchId = path.split('/')[3];
         
-        // Get match performances to update player stats
         const performances = await env.DB.prepare(
           'SELECT * FROM match_performances WHERE match_id = ?'
         ).bind(matchId).all();
 
-        // Update player stats (subtract the match data)
         for (let perf of performances.results) {
           await env.DB.prepare(
             `UPDATE players 
@@ -121,42 +230,35 @@ export default {
           ).bind(perf.goals, perf.saves, perf.assists, perf.player_id).run();
         }
 
-        // Delete match performances
         await env.DB.prepare(
           'DELETE FROM match_performances WHERE match_id = ?'
         ).bind(matchId).run();
 
-        // Delete the match
         await env.DB.prepare(
           'DELETE FROM matches WHERE id = ?'
         ).bind(matchId).run();
 
-        return jsonResponse({ success: true, message: 'Match deleted' }, corsHeaders);
+        return jsonResponse({ success: true }, corsHeaders);
       }
 
-      // DELETE /api/players/:id - Delete a player
+      // DELETE /api/players/:id - Delete player (admin only)
       if (path.startsWith('/api/players/') && request.method === 'DELETE') {
+        const authUser = getAuthUser(request);
+        if (!authUser || authUser.role !== 'admin') {
+          return jsonResponse({ error: 'Unauthorized - Admin only' }, corsHeaders, 403);
+        }
+
         const playerId = path.split('/')[3];
         
-        // Delete player's match performances
         await env.DB.prepare(
           'DELETE FROM match_performances WHERE player_id = ?'
         ).bind(playerId).run();
 
-        // Delete the player
         await env.DB.prepare(
           'DELETE FROM players WHERE id = ?'
         ).bind(playerId).run();
 
-        return jsonResponse({ success: true, message: 'Player deleted' }, corsHeaders);
-      }
-
-      // DELETE /api/reset - Reset all data (for testing)
-      if (path === '/api/reset' && request.method === 'DELETE') {
-        await env.DB.prepare('DELETE FROM match_performances').run();
-        await env.DB.prepare('DELETE FROM matches').run();
-        await env.DB.prepare('DELETE FROM players').run();
-        return jsonResponse({ success: true, message: 'All data deleted' }, corsHeaders);
+        return jsonResponse({ success: true }, corsHeaders);
       }
 
       return jsonResponse({ error: 'Not found' }, corsHeaders, 404);
