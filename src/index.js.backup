@@ -1,0 +1,75 @@
+import { corsHeaders, jsonResponse } from './utils/response.js';
+import { getAuthUser } from './utils/jwt.js';
+import { handleLogin, handleRegister } from './routes/auth.js';
+import { handleGetUsers, handleResetPassword, handleDeleteUser } from './routes/users.js';
+import { handleGetPlayers, handleCreatePlayer, handleDeletePlayer } from './routes/players.js';
+import { handleGetMatches, handleCreateMatch, handleDeleteMatch } from './routes/matches.js';
+
+const JWT_SECRET = 'your-secret-key-change-this-in-production';
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    try {
+      const authUser = getAuthUser(request, JWT_SECRET);
+
+      // Auth routes
+      if (path === '/api/auth/login' && request.method === 'POST') {
+        return handleLogin(request, env, JWT_SECRET);
+      }
+      if (path === '/api/auth/register' && request.method === 'POST') {
+        return handleRegister(request, env, authUser);
+      }
+
+      // User routes
+      if (path === '/api/users' && request.method === 'GET') {
+        return handleGetUsers(env, authUser);
+      }
+      if (path.match(/^\/api\/users\/\d+\/password$/) && request.method === 'PUT') {
+        const userId = parseInt(path.split('/')[3]);
+        return handleResetPassword(request, env, authUser, userId);
+      }
+      if (path.match(/^\/api\/users\/\d+$/) && request.method === 'DELETE') {
+        const userId = parseInt(path.split('/')[3]);
+        return handleDeleteUser(env, authUser, userId);
+      }
+
+      // Player routes
+      if (path === '/api/players' && request.method === 'GET') {
+        return handleGetPlayers(env, authUser);
+      }
+      if (path === '/api/players' && request.method === 'POST') {
+        return handleCreatePlayer(request, env, authUser);
+      }
+      if (path.startsWith('/api/players/') && request.method === 'DELETE') {
+        const playerId = path.split('/')[3];
+        return handleDeletePlayer(env, authUser, playerId);
+      }
+
+      // Match routes
+      if (path === '/api/matches' && request.method === 'GET') {
+        return handleGetMatches(env, authUser);
+      }
+      if (path === '/api/matches' && request.method === 'POST') {
+        return handleCreateMatch(request, env, authUser);
+      }
+      if (path.startsWith('/api/matches/') && request.method === 'DELETE') {
+        const matchId = path.split('/')[3];
+        return handleDeleteMatch(env, authUser, matchId);
+      }
+
+      return jsonResponse({ error: 'Not found' }, corsHeaders, 404);
+
+    } catch (error) {
+      console.error('API Error:', error);
+      return jsonResponse({ error: error.message }, corsHeaders, 500);
+    }
+  },
+};
